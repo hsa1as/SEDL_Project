@@ -1,0 +1,13 @@
+[project]
+name = "better_prune"
+version = "0.1.0"
+description = "CS6886 Project"
+
+[build-system]
+build-backend = "flit_core.buildapi"
+requires = ["flit_core >=3.2,<4"]
+
+[dependency-groups]
+dev = [
+    "ty>=0.0.1a25",
+]

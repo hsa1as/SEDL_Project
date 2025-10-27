@@ -1,0 +1,102 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environments
+.venv/
+venv/
+venv_wsl/
+env/
+ENV/
+env.bak/
+.venv.bak/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+MANIFEST
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+*.lcov
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# pyenv / poetry / pipenv
+.python-version
+poetry.lock
+Pipfile.lock
+
+# PyInstaller
+# Usually these files are written by PyInstaller to store build metadata
+*.manifest
+*.spec
+
+# mypy / type checker / linter
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+ruff_cache/
+.pyright/
+
+# Cython debug symbols
+cython_debug/
+
+# VSCode / PyCharm / IDE configs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs / temp files
+*.log
+logs/
+tmp/
+temp/
+
+# Data files
+*.csv
+*.tsv
+*.sqlite3
+*.db
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# macOS / Linux / Windows junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PyTorch junk
+*.pt
+
+.pytest_cache/
+

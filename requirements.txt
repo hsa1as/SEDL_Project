@@ -1,0 +1,12 @@
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+torch==2.9.1+cu130
+
+accelerate==1.11.0
+datasets==3.6.0
+transformers==4.57.1
+lm-eval==0.4.9.1
+wandb
+matplotlib
+numpy

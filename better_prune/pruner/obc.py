@@ -19,7 +19,7 @@ class DuoGPTConfig:
     w_bits: int = 32
     prunen: int = 0
     prunem: int = 0
-    percdamp: float =  0.01
+    percdamp: float =  0.05
     blocksize: int = 128
     scale_alpha: float = 0.125
     nsamples: int =128
@@ -172,7 +172,7 @@ class DuoGPT:
                 w = W1[:, i]
                 d = Hinv1[i, i]
 
-                if prunen != 0 and i % prunem == 0:
+                if prunen != 0 and i % prunem == 0 and prunen < W1[:, i:(i+prunem)].shape[1]:
                     tmp = W1[:, i:(i + prunem)] ** 2 / torch.diag(Hinv1)[i:(i + prunem)].reshape((1, -1)) ** 2 + W1[:, i:(i + prunem)]**2 * (Lp_coe2-Lp_coe3+Lp_coe4)[:,i:(i + prunem)] * alpha
                     mask1.scatter_(1, i + torch.topk(tmp, prunen, dim=1, largest=False)[1], True)
 
@@ -201,6 +201,7 @@ class DuoGPT:
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
         if torch.any(torch.isnan(self.layer.weight.data)):
             raise ValueError('NaN in weights')
+        return mask
 
     def free(self):
         del self.fp_inp
@@ -209,6 +210,8 @@ class DuoGPT:
         # self.Losses = None
         self.dXXT = None
         self.dXdXT = None
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         torch.cuda.empty_cache()
         cleanup_memory()
 
@@ -243,6 +246,8 @@ class FPInputsCache:
         for h in self.handles:
             h.remove()
         self.handles = []
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
     def clear_cache(self):
@@ -317,6 +322,8 @@ def process_layer(layer, fp_inputs_cache:FPInputsCache, fp_inps:torch.Tensor, at
                 gpts[name].H = gpts[first_module_name].H
                 gpts[name].dXXT = gpts[first_module_name].dXXT
                 gpts[name].dXdXT = gpts[first_module_name].dXdXT #! New for DuoGPT
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     layer.to(layer_dev) # move back
     cleanup_memory()
     return gpts
@@ -379,6 +386,8 @@ def capture_embeddings(model_runner: ModelRunner, dataloader: Any,
             def __init__(self, module):
                 super().__init__()
                 self.module = module
+                if hasattr(module, "attention_type"):
+                    self.attention_type = module.attention_type
 
             def forward(self, inp, **kwargs):
                 inps[cache['i']] = inp
@@ -393,6 +402,8 @@ def capture_embeddings(model_runner: ModelRunner, dataloader: Any,
                 model(batch[0].to(dev)) #! This will catch the output states from the embedding.
             except ValueError:
                 pass
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         layers[0] = layers[0].module #! Remove the catcher module.
         layers[0] = layers[0].cpu() #! Put the layer back to cpu.
 
@@ -416,36 +427,38 @@ def capture_embeddings(model_runner: ModelRunner, dataloader: Any,
     i = 0
     if inps_contain_layer_inps:
         i = layer_idx
-    with tqdm.tqdm(total=layer_idx-i) as pbar:
-        while i < layer_idx + 1:
-            full = find_layers(layers[i], layers=[torch.nn.Linear])
-            if VERBOSITY.info:
-                print("Processing layer ", i)
-            gpts = process_layer(layers[i], fp_inputs_cache, 
-                                fp_inps, attention_mask,
-                                position_embeddings, args, full,
-                                sequential, inps, outs)
-            for names in sequential:
-                subset = {n: full[n] for n in names}
-                if i != layer_idx:
-                    for name in subset:
-                        #gpts[name].fasterprune(
-                        #    args=args
-                        #)
-                        gpts[name].free()
-
-            #! For generating the outputs for the next layer.
-            #  no need if this is the target layer_idx
+    while i < layer_idx + 1:
+        full = find_layers(layers[i], layers=[torch.nn.Linear])
+        if VERBOSITY.info:
+            print("Processing layer ", i)
+        gpts = process_layer(layers[i], fp_inputs_cache, 
+                            fp_inps, attention_mask,
+                            position_embeddings, args, full,
+                            sequential, inps, outs)
+        for names in sequential:
+            subset = {n: full[n] for n in names}
             if i != layer_idx:
-                fp_inputs_cache.clear_cache()
-                layers[i] = layers[i].cpu()
-                del gpts
-                torch.cuda.empty_cache()
-                inps, outs = outs, inps
-            else:
-                return CalibrationResult(layer_idx, inps, outs, gpts, position_embeddings, attention_mask)
-            i += 1
-            pbar.update(1)
+                for name in subset:
+                    #gpts[name].fasterprune(
+                    #    args=args
+                    #)
+                    gpts[name].free()
+
+        #! For generating the outputs for the next layer.
+        #  no need if this is the target layer_idx
+        if i != layer_idx:
+            fp_inputs_cache.clear_cache()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            layers[i] = layers[i].cpu()
+            del gpts
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            inps, outs = outs, inps
+        else:
+            return CalibrationResult(layer_idx, inps, outs, gpts, position_embeddings, attention_mask)
+        i += 1
 
 ######### activation stuff ##########
 def prune(x: torch.Tensor, sparsity: float =0.5):
@@ -709,9 +722,10 @@ def cleanup_memory() -> None:
     gc.collect()
 
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
         memory_after = total_reserved_mem()
-        if VERBOSITY.info:
+        if VERBOSITY.memory:
             print(
                 f"GPU memory{caller_name}: {memory_before / (1024 ** 3):.2f} -> {memory_after / (1024 ** 3):.2f} GB"
                 f" ({(memory_after - memory_before) / (1024 ** 3):.2f} GB)"

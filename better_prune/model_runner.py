@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.profiler import profile, ProfilerActivity, record_function # noqa: F401
 
-from transformers import PreTrainedModel, PreTrainedTokenizerBase, LlamaForCausalLM
+from transformers import PreTrainedModel, PreTrainedTokenizerBase, LlamaForCausalLM, AutoModelForCausalLM
 
 from better_prune.utils.consts import MODEL_CACHE
 
@@ -84,7 +84,7 @@ class ModelRunner(ABC):
         """Measure device and host memory usage for a representative batch."""
 
     @abstractmethod
-    def get_layerwise_perf(self, inp: torch.Tensor, layer: nn.Module) -> Dict[str, float]:
+    def get_layerwise_perf(self, inp: torch.Tensor, layer: nn.Module, layer_kwargs: Dict, runs:int=10, warmup:int = 10) -> Dict[str, float]:
         """Get layerwise performance metrics given input and output tensors."""
 
     def default_prompts(self) -> Sequence[str]:
@@ -153,21 +153,23 @@ class NativeModelRunner(ModelRunner):
 
     def generate(self, prompts: Sequence[str], max_new_tokens: int) -> List[str]:
         """Generate continuations for a batch of prompts, applying chat template automatically."""
-        outputs, _ = self._generate_internal(
+        outputs, _, _ = self._generate_internal(
             prompts,
             max_new_tokens=max_new_tokens,
             use_chat_template=self.is_chat_ft,
             record_timing=False,
+            decode=True,
         )
         return outputs
 
     def generate_no_template(self, prompts: Sequence[str], max_new_tokens: int) -> List[str]:
         """Generate continuations for a batch of prompts."""
-        outputs, _ = self._generate_internal(
+        outputs, _, _ = self._generate_internal(
             prompts,
             max_new_tokens=max_new_tokens,
             use_chat_template=False,
             record_timing=False,
+            decode=True,
         )
         return outputs
 
@@ -176,11 +178,12 @@ class NativeModelRunner(ModelRunner):
         #self._run_warmup([prompt], max_new_tokens, warmup)
         durations: List[float] = []
         for _ in range(runs):
-            _, duration_ms = self._generate_internal(
+            _, duration_ms, _ = self._generate_internal(
                 [prompt],
                 max_new_tokens=max_new_tokens,
                 use_chat_template=self.is_chat_ft,
                 record_timing=True,
+                decode=False,
             )
             if duration_ms is not None:
                 durations.append(duration_ms)
@@ -192,15 +195,20 @@ class NativeModelRunner(ModelRunner):
         total_tokens = 0
         total_time = 0.0
         for _ in range(runs):
-            outputs, duration_ms = self._generate_internal(
+            _, duration_ms, gen_tokens = self._generate_internal(
                 prompts,
                 max_new_tokens=max_new_tokens,
                 use_chat_template=self.is_chat_ft,
                 record_timing=True,
+                decode=False,
             )
             total_time += (duration_ms or 0.0) / 1000.0
-            total_tokens += self._count_generated_tokens(prompts, outputs)
-            del outputs
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                # count all tokens if no pad id
+                total_tokens += int((gen_tokens.numel()))
+            else:
+                total_tokens += int((gen_tokens != pad_id).sum().item())
         return total_tokens / total_time if total_time > 0 else 0.0
 
     def measure_batch_inference_time(self, prompts: Sequence[str], max_new_tokens: int, runs: int = 3) -> float:
@@ -208,11 +216,12 @@ class NativeModelRunner(ModelRunner):
         #self._run_warmup(prompts, max_new_tokens, 1)
         durations: List[float] = []
         for _ in range(runs):
-            _, duration_ms = self._generate_internal(
+            _, duration_ms, _ = self._generate_internal(
                 prompts,
                 max_new_tokens=max_new_tokens,
                 use_chat_template=self.is_chat_ft,
                 record_timing=True,
+                decode=False,
             )
             if duration_ms is not None:
                 durations.append(duration_ms)
@@ -230,13 +239,13 @@ class NativeModelRunner(ModelRunner):
             torch.cuda.reset_peak_memory_stats(self.device)
             self._sync_device()
 
-        outputs, _ = self._generate_internal(
+        _, _duration_ms, _gen = self._generate_internal(
             prompts,
             max_new_tokens=max_new_tokens,
             use_chat_template=self.is_chat_ft,
             record_timing=False,
+            decode=False,
         )
-        del outputs
         self._sync_device()
 
         if self.device.type == "cuda":
@@ -262,15 +271,28 @@ class NativeModelRunner(ModelRunner):
             peak_cpu_memory_mb=peak_cpu,
             current_cpu_memory_mb=current_cpu,
         )
-    def get_layerwise_perf(self, inp, layer: nn.Module, layer_kwargs: Dict) -> Dict[str, Any]:
+    def get_layerwise_perf(self, inp, layer: nn.Module, layer_kwargs: Dict, runs = 10, warmup=10) -> Dict[str, Any]:
         layer_dev = next(iter(layer.parameters())).device
         layer.to(self.device)
-        with profile(activities=[ProfilerActivity.CUDA], record_shapes=True) as prof:
-            _ = layer(inp, **layer_kwargs)
-        cuda_time = sum([e.cuda_time_total for e in prof.events()])
-        layer.to(layer_dev)
-        del prof
-        return {"time": cuda_time}
+        inp.to(self.device)
+        time = 0
+        if self.device == torch.device("cuda"):
+            starter = torch.cuda.Event(enable_timing=True)
+            ender = torch.cuda.Event(enable_timing=True)
+            for _ in range(warmup):
+                _ = layer(inp, **layer_kwargs)
+            torch.cuda.synchronize()
+            for i in range(runs):
+                starter.record()
+                _ = layer(inp, **layer_kwargs)
+                ender.record()
+                torch.cuda.synchronize()
+                time += starter.elapsed_time(ender)
+
+            time /= runs
+            layer.to(layer_dev)
+            return {"time": time}
+        return {"time": 1}
 
 
     def get_lm_eval_model(self, batch_size: int) -> Any:
@@ -283,6 +305,7 @@ class NativeModelRunner(ModelRunner):
             batch_size=batch_size,
             device=str(self.device),
             trust_remote_code=True,
+            use_fast_tokenizer=False,
         )
 
     def _run_warmup(self, prompts: Sequence[str], max_new_tokens: int, warmup: int) -> None:
@@ -314,7 +337,8 @@ class NativeModelRunner(ModelRunner):
         max_new_tokens: int,
         use_chat_template: bool,
         record_timing: bool,
-    ) -> Tuple[List[str], float | None]:
+        decode: bool,
+    ) -> Tuple[List[str] | None, float | None, torch.Tensor]:
         """Internal helper that handles formatting, timing, and decoding."""
         formatted_prompts = self._format_prompts(prompts, use_chat_template=use_chat_template)
 
@@ -358,8 +382,11 @@ class NativeModelRunner(ModelRunner):
             duration_ms = float((time.perf_counter() - start_time) * 1000.0)
 
         generated_tokens = outputs[:, inputs["input_ids"].shape[1]:]
-        decoded = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
-        return decoded, duration_ms
+        decoded = None
+        if decode:
+            # Avoids tokenizer crashes during perf runs
+            decoded = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+        return decoded, duration_ms, generated_tokens
 
     def _format_prompts(self, prompts: Sequence[str], use_chat_template: bool) -> List[str]:
         """Apply chat templates when requested; otherwise return raw prompts."""
@@ -438,16 +465,22 @@ def get_model(model_id: str, is_chat_ft: bool=False, seqlen:int=2048) -> NativeM
     torch.nn.init.normal_ = skip
 
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=MODEL_CACHE,
-                                              trust_remote_code=True, model_max_len=seqlen)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model = LlamaForCausalLM.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         model_id,
         cache_dir=MODEL_CACHE,
         trust_remote_code=True,
+        model_max_len=seqlen,
         dtype="auto",
+        use_fast=False,  # avoid Rust tokenizer crashes with lm-eval/multiprocessing
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained( #LlamaForCausalLM.from_pretrained(
+        model_id,
+        cache_dir=MODEL_CACHE,
+        trust_remote_code=True,
         low_cpu_mem_usage=True,
+        dtype="auto"
     )
     model.seqlen=2048
     return NativeModelRunner(model=model, tokenizer=tokenizer, device="cuda", is_chat_ft=is_chat_ft)

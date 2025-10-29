@@ -12,12 +12,14 @@ pytest.importorskip("lm_eval")
 from ..benchmarks.suite import BenchmarkSuite
 from ..benchmarks.tasks import ARCTask, BoolQTask, GSM8KTask, MMLUTask
 from ..model_runner import NativeModelRunner
+from ..utils.consts import DEFAULT_MODEL_ID
 
 MODEL_CACHE = Path.home() / ".cache" / "better_prune" / "models"
 MODEL_CACHE.mkdir(parents=True, exist_ok=True)
 #MODEL_ID = "openai/gpt-oss-20b"
 #MODEL_ID = "meta-llama/Llama-3.1-8B"
-MODEL_ID ="meta-llama/Meta-Llama-3-8B"
+#MODEL_ID ="meta-llama/Meta-Llama-3-8B"
+MODEL_ID = DEFAULT_MODEL_ID
 
 def load_test_runner() -> NativeModelRunner:
     """Load a medium-scale causal LM for testing."""
@@ -60,9 +62,9 @@ def test_benchmark_suite_runs_standard_tasks_real_data() -> None:
     """Run suite across standard tasks with downloaded datasets."""
     runner = load_test_runner()
     tasks = [
-        GSM8KTask(limit=100, num_fewshot=8, batch_size=8),
-       # BoolQTask(limit=100, num_fewshot=3, batch_size=10),
-       # ARCTask(variant="arc_challenge", limit=100, num_fewshot=25, batch_size=10),
+        #GSM8KTask(limit=100, num_fewshot=8, batch_size=8),
+        BoolQTask(limit=100, num_fewshot=3, batch_size=10),
+        ARCTask(variant="arc_challenge", limit=100, num_fewshot=25, batch_size=10),
        # MMLUTask(subjects=("math",), limit=100, num_fewshot=5, batch_size=10),
     ]
 

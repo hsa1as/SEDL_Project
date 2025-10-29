@@ -1,6 +1,7 @@
 import argparse
 from typing import Callable, Dict, List, Sequence
 
+import faulthandler, os
 import torch
 
 from better_prune.benchmarks import BenchmarkSuite
@@ -15,25 +16,16 @@ from better_prune.utils.measure_perf import (
     set_measure_ctx,
 )
 
-SEQLEN = 2048
-DEFAULT_MODEL_ID = "meta-llama/Meta-Llama-3-8B"
-DEFAULT_DATASET = "c4"
-DEFAULT_CALIBRATION_SAMPLES = 128
-DEFAULT_BATCH_SIZES = (64, 128, 256)
-DEFAULT_MAX_TOKENS_PERF = 32
-DEFAULT_MAX_NEW_TOKENS = 64
-DEFAULT_TASKS = ("boolq","arc")
-LATENCY_RUNS = 5
-THROUGHPUT_RUNS = 10
-BATCH_RUNS = 5
+from better_prune.utils.consts import (DEFAULT_BATCH_SIZES, DEFAULT_CALIBRATION_SAMPLES, DEFAULT_DATASET,
+     DEFAULT_MAX_NEW_TOKENS, DEFAULT_MAX_TOKENS_PERF, DEFAULT_MODEL_ID, DEFAULT_TASKS, LATENCY_RUNS, THROUGHPUT_RUNS, BATCH_RUNS, SEQLEN)
 
 TaskFactory = Callable[[], object]
 
 TASK_FACTORIES: Dict[str, TaskFactory] = {
-    "gsm8k": lambda: GSM8KTask(limit=100, num_fewshot=8, batch_size=8),
-    "boolq": lambda: BoolQTask(limit=100, num_fewshot=8, batch_size=10),
-    "arc": lambda: ARCTask(variant="arc_challenge", limit=100, num_fewshot=25, batch_size=10),
-    "mmlu": lambda: MMLUTask(subjects=("math",), limit=100, num_fewshot=5, batch_size=10),
+    "gsm8k": lambda: GSM8KTask(limit=100, num_fewshot=8, batch_size=1),
+    "boolq": lambda: BoolQTask(limit=100, num_fewshot=8, batch_size=1),
+    "arc": lambda: ARCTask(variant="arc_challenge", limit=100, num_fewshot=25, batch_size=1),
+    "mmlu": lambda: MMLUTask(subjects=("math",), limit=100, num_fewshot=5, batch_size=1),
 }
 
 
@@ -116,7 +108,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip accuracy benchmarks after pruning.",
     )
-    parser.add_argument("--save-path", type=str, default="", help="Optional path to save the pruned model state.")
+    parser.add_argument("--save-path", type=str, default="pruned_model.pt", help="Optional path to save the pruned model state.")
     return parser.parse_args()
 
 
@@ -152,12 +144,19 @@ def run_benchmarks(model_runner, tasks: Sequence[object], max_new_tokens: int) -
 
 
 def main() -> None:
+    #install_segfault_handler()
+    faulthandler.enable()
+    os.environ["TORCH_SHOW_CPP_STACKTRACES"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parse_args()
     tasks = resolve_tasks(args.tasks)
     model = get_model(args.model_id, seqlen=SEQLEN)
     model.model.eval()
+    for p in model.model.parameters():
+        p.requires_grad = False
 
-    with torch.no_grad():
+    #with torch.no_grad():
+    for i in range(1):
         add_actprune(model.model)
         disable_act_sparsity(model.model)
 
@@ -178,12 +177,17 @@ def main() -> None:
                 seqlen=SEQLEN,
                 eval_mode=args.eval_mode,
             )
-            calibrate.calibrate_model(model, loader)
+            #calibrate.calibrate_model(model, loader)
+            #calibrate.calibrate_model_using_ops(model, loader)
+            calibrate.run_bo_obc(model, loader)
 
         disable_act_sparsity(model.model)
+        #model.model.to(model.device)
+        #model.model.compile()
+        torch.save(model.model.state_dict(), args.save_path)
+        model = get_model(args.model_id, seqlen=SEQLEN)
+        model.model.load_state_dict(torch.load(args.save_path, weights_only=True), strict=False) # strict is false due to fake wrappers
         model.model.to(model.device)
-        model.model.compile()
-
         print("Pruned model statistics")
         if not args.skip_pruned_perf:
             print("Measuring pruned model performance")

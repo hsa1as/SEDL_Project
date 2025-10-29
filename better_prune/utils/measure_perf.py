@@ -46,6 +46,7 @@ def build_runner(args: argparse.Namespace) -> NativeModelRunner:
         args.model_id,
         cache_dir=cache_dir,
         trust_remote_code=not args.no_trust_remote_code,
+        use_fast=False
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -74,7 +75,7 @@ def build_runner(args: argparse.Namespace) -> NativeModelRunner:
         print("Attempting to load model ")
         loaded= torch.load(args.load_state)
         model.load_state_dict(loaded["model"], strict=False)
-    model.compile()
+    #model.compile()
     runner = NativeModelRunner(
         model=model,
         tokenizer=tokenizer,
@@ -169,7 +170,7 @@ def parse_args() -> argparse.Namespace:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to run inference on (e.g. cpu, cuda, cuda:0).",
     )
-    parser.add_argument("--batch-sizes", type=parse_batch_sizes, default=parse_batch_sizes("1,2,4,8"))
+    parser.add_argument("--batch-sizes", type=parse_batch_sizes, default=parse_batch_sizes("64, 128, 256"))
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--latency-runs", type=int, default=5)
     parser.add_argument("--throughput-runs", type=int, default=10)
@@ -194,6 +195,7 @@ def main() -> None:
     torch._logging.set_logs(graph_code=False)
     args = parse_args()
     runner = build_runner(args)
+    runner.model.to(runner.device)
     base_prompts = list(runner.default_prompts())
     if not base_prompts:
         raise ValueError("Model runner must provide at least one default prompt to measure performance.")

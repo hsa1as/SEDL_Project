@@ -1,3 +1,4 @@
+import torch
 from .suite import BenchmarkReport, BenchmarkSuite, TaskResult
 from .tasks import ARCTask, BenchmarkTask, BoolQTask, GSM8KTask, MMLUTask
 

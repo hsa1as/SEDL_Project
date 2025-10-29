@@ -3,13 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence
 
-try:  # pragma: no cover - optional dependency
-    from lm_eval import evaluator  # type: ignore
+#try:  # pragma: no cover - optional dependency
+from lm_eval import simple_evaluate  # type: ignore
 
-    LM_EVAL_AVAILABLE = True
-except ImportError:  # pragma: no cover - handled at runtime
-    evaluator = None  # type: ignore
-    LM_EVAL_AVAILABLE = False
+LM_EVAL_AVAILABLE = True
+#except ImportError:  # pragma: no cover - handled at runtime
+#    LM_EVAL_AVAILABLE = False
 
 from ..model_runner import ModelRunner, PerformanceMetrics
 from .tasks import BenchmarkTask
@@ -98,7 +97,7 @@ class BenchmarkSuite:
 
         for harness_name in task.harness_task_names():
             task_generation_kwargs = generation_kwargs
-            evaluation = evaluator.simple_evaluate(
+            evaluation = simple_evaluate(
                 harness_model,
                 tasks=[harness_name],
                 num_fewshot=task.config.num_fewshot,

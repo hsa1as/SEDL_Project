@@ -3,154 +3,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Any
+
+import random
 
 import torch
-from .obc import DuoGPTConfig
+from torch import Tensor
+from .obc import DuoGPTConfig, prealloc_inps_outs, capture_embeddings, CalibrationResult, cleanup_memory
 
 __all__ = [
-    "ParameterType",
-    "ParameterSpec",
-    "PruningSearchSpace",
-    "LayerPrunePlan",
-    "ToDuoGPTConfig",
-    "PerformanceMetric",
     "LayerEvaluation",
-    "EvaluationDataset",
     "LayerMetrics",
     "build_layer_evaluation",
-    "GaussianProcess",
-    "expected_improvement",
-    "BayesianTuner",
 ]
-
-
-class ParameterType(Enum):
-    CONTINUOUS = "continuous"
-    INTEGER = "integer"
-    CATEGORICAL = "categorical"
-
-
-@dataclass(frozen=True)
-class ParameterSpec:
-    name: str
-    type: ParameterType
-    bounds: Tuple[float, float]
-    choices: Optional[Sequence[float]] = None
-    log_scale: bool = False
-
-    def __post_init__(self) -> None:
-        lo, hi = self.bounds
-        if lo >= hi:
-            raise ValueError(f"Invalid bounds {self.bounds} for {self.name}")
-        if self.choices is not None and not self.choices:
-            raise ValueError(f"{self.name} choices must not be empty.")
-        if self.choices is not None:
-            sorted_choices = sorted(self.choices)
-            object.__setattr__(self, "choices", tuple(sorted_choices))
-
-    def validate(self, value: float) -> None:
-        if self.choices is not None and value not in self.choices:
-            raise ValueError(f"{value} not permitted for parameter {self.name}")
-        lo, hi = self.bounds
-        if value < lo or value > hi:
-            raise ValueError(f"{value} outside bounds {self.bounds} for {self.name}")
-        if self.type == ParameterType.INTEGER and not float(value).is_integer():
-            raise ValueError(f"{self.name} requires an integer value, got {value}")
-
-    def normalise(self, value: float) -> float:
-        self.validate(value)
-        if self.choices is not None:
-            idx = self.choices.index(value)  # value validated above
-            return idx / (len(self.choices) - 1) if len(self.choices) > 1 else 0.0
-        lo, hi = self.bounds
-        if self.log_scale:
-            lo = torch.log(torch.tensor(lo))
-            hi = torch.log(torch.tensor(hi))
-            value = torch.log(torch.tensor(value))
-            return float((value - lo) / (hi - lo))
-        return float((value - lo) / (hi - lo))
-
-    def denormalise(self, value: float) -> float:
-        value = float(torch.clamp(torch.tensor(value), 0.0, 1.0))
-        if self.choices is not None:
-            if len(self.choices) == 1:
-                return float(self.choices[0])
-            idx = min(int(round(value * (len(self.choices) - 1))), len(self.choices) - 1)
-            return float(self.choices[idx])
-        lo, hi = self.bounds
-        raw = lo + value * (hi - lo)
-        if self.log_scale:
-            return float(torch.exp(torch.tensor(raw)))
-        if self.type == ParameterType.INTEGER:
-            return float(round(raw))
-        return raw
-
-@dataclass
-class PruningSearchSpace:
-    parameters: Dict[str, ParameterSpec]
-
-    def __post_init__(self) -> None:
-        for spec in self.parameters.values():
-            if spec.name not in self.parameters:
-                raise KeyError(f"Parameter {spec.name} not registered.")
-
-    @classmethod
-    def default(cls) -> "PruningSearchSpace":
-        params = {
-            "weight_sparsity": ParameterSpec(
-                name="weight_sparsity",
-                type=ParameterType.CONTINUOUS,
-                bounds=(0.0, 0.98),
-            ),
-            "blocksize": ParameterSpec(
-                name="blocksize",
-                type=ParameterType.INTEGER,
-                bounds=(16, 512),
-                choices=(16, 32, 64, 128, 256, 512),
-            ),
-            "prunen": ParameterSpec(
-                name="prunen",
-                type=ParameterType.INTEGER,
-                bounds=(0, 8),
-                choices=(0, 1, 2, 4, 8),
-            ),
-            "prunem": ParameterSpec(
-                name="prunem",
-                type=ParameterType.INTEGER,
-                bounds=(1, 16),
-                choices=(1, 2, 4, 8, 16),
-            ),
-        }
-        return cls(parameters=params)
-
-    def spec(self, name: str) -> ParameterSpec:
-        if name not in self.parameters:
-            raise KeyError(f"Unknown parameter {name}")
-        return self.parameters[name]
-
-    def normalise_plan(self, plan: Mapping[str, float]) -> torch.Tensor:
-        values = []
-        for name, spec in self.parameters.items():
-            if name not in plan:
-                raise KeyError(f"{name} missing from plan.")
-            values.append(spec.normalise(plan[name]))
-        return torch.tensor(values, dtype=torch.float32)
-
-    def denormalise_plan(self, encoded: torch.Tensor) -> Dict[str, float]:
-        if encoded.numel() != len(self.parameters):
-            raise ValueError("Encoded vector size does not match parameter count.")
-        decoded: Dict[str, float] = {}
-        for idx, (name, spec) in enumerate(self.parameters.items()):
-            decoded[name] = spec.denormalise(float(encoded[idx]))
-        return decoded
-
-    def sample_sobol(self, n: int, seed: Optional[int] = None) -> List[Dict[str, float]]:
-        if n <= 0:
-            raise ValueError("Number of samples must be positive.")
-        engine = torch.quasirandom.SobolEngine(dim=len(self.parameters), scramble=True, seed=seed)
-        samples = engine.draw(n)
-        return [self.denormalise_plan(sample) for sample in samples]
 
 
 @dataclass
@@ -175,27 +40,6 @@ class LayerPrunePlan:
             "prunem": float(self.prunem),
         }
 
-    def validate(self, space: PruningSearchSpace) -> None:
-        params = self.as_dict()
-        if self.prunen and self.prunen > self.prunem:
-            raise ValueError("prunen must be <= prunem.")
-        for name, value in params.items():
-            space.spec(name).validate(value)
-
-
-@dataclass
-class ToDuoGPTConfig:
-    base_config: DuoGPTConfig
-    space: PruningSearchSpace = field(default_factory=PruningSearchSpace.default)
-
-    def for_layer(self, plan: LayerPrunePlan) -> DuoGPTConfig:
-        plan.validate(self.space)
-        cfg = replace(self.base_config)
-        cfg.sparsity = plan.weight_sparsity
-        cfg.blocksize = int(plan.blocksize)
-        cfg.prunen = int(plan.prunen)
-        cfg.prunem = int(plan.prunem)
-        return cfg
 
 def duo_to_layer(cfg: DuoGPTConfig) -> LayerPrunePlan:
     return LayerPrunePlan(
@@ -235,33 +79,6 @@ class LayerEvaluation:
         return self.metrics.get(metric.value)
 
 
-@dataclass
-class EvaluationDataset:
-    space: PruningSearchSpace
-    records: List[LayerEvaluation] = field(default_factory=list)
-
-    def add(self, record: LayerEvaluation) -> None:
-        record.plan.validate(self.space)
-        self.records.append(record)
-
-    def as_tensors(
-        self,
-        objective: PerformanceMetric,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not self.records:
-            raise ValueError("Dataset is empty.")
-        features = []
-        targets = []
-        for record in self.records:
-            features.append(self.space.normalise_plan(record.plan.as_dict()))
-            metric = record.get_metric(objective)
-            if metric is None:
-                raise KeyError(f"Metric {objective.value} missing for record.")
-            targets.append(metric)
-        feature_tensor = torch.stack(features, dim=0)
-        target_tensor = torch.tensor(targets, dtype=torch.float32).unsqueeze(-1)
-        return feature_tensor, target_tensor
-
 
 @dataclass
 class LayerMetrics:
@@ -287,88 +104,319 @@ def build_layer_evaluation(
     notes: Dict[str, float] = {}
     return LayerEvaluation(layer_idx=layer_idx, plan=plan, metrics=metrics, notes=notes)
 
-class GaussianProcess(torch.nn.Module):
-    def __init__(self, input_dim: int, noise: float = 1e-4) -> None:
-        super().__init__()
-        self.input_dim = input_dim
-        self.noise = noise
-        self.lengthscale = torch.nn.Parameter(torch.ones(1) * 0.2)
-        self.outputscale = torch.nn.Parameter(torch.ones(1))
+from typing import Dict, Any, Tuple, List, Optional
+import torch
+from torch import Tensor
+from botorch.models import SingleTaskGP, ModelListGP
+from botorch.fit import fit_gpytorch_mll
+from botorch.optim import optimize_acqf
+from botorch.acquisition.multi_objective.monte_carlo import qExpectedHypervolumeImprovement
+from botorch.acquisition.multi_objective.logei import qLogExpectedHypervolumeImprovement
+from botorch.sampling import SobolQMCNormalSampler
+from botorch.utils.multi_objective.box_decompositions import NondominatedPartitioning
+from gpytorch.mlls.sum_marginal_log_likelihood import SumMarginalLogLikelihood
 
-    def kernel(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        x1 = x1 / self.lengthscale
-        x2 = x2 / self.lengthscale
-        sqdist = torch.cdist(x1, x2) ** 2
-        return self.outputscale ** 2 * torch.exp(-0.5 * sqdist)
+import matplotlib.pyplot as plt
 
-    def forward(self, train_x: torch.Tensor, train_y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        k_xx = self.kernel(train_x, train_x)
-        noise = self.noise * torch.eye(len(train_x), device=train_x.device)
-        L = torch.linalg.cholesky(k_xx + noise)
-        alpha = torch.cholesky_solve(train_y, L)
-        return L, alpha
-
-    def predict(self, train_x: torch.Tensor, train_y: torch.Tensor, test_x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        L, alpha = self(train_x, train_y)
-        k_xs = self.kernel(train_x, test_x)
-        mean = k_xs.transpose(0, 1).matmul(alpha)
-        v = torch.cholesky_solve(k_xs, L)
-        k_ss = self.kernel(test_x, test_x)
-        var = k_ss - k_xs.transpose(0, 1).matmul(v)
-        return mean.squeeze(-1), var.diag().clamp_min(1e-9)
+from .obc import DEFAULT_CONFIG
+from ..model_runner import ModelRunner
 
 
-def expected_improvement(
-    mean: torch.Tensor,
-    var: torch.Tensor,
-    best: float,
-    explore: float,
-) -> torch.Tensor:
-    std = var.sqrt()
-    z = (best - mean - explore) / std.clamp_min(1e-9)
-    normal = torch.distributions.Normal(0, 1)
-    return (best - mean - explore) * normal.cdf(z) + std * normal.log_prob(z).exp()
+class BayesianForObc:
+
+    def __init__(
+        self,
+        layer_idx: int,
+        model_runner: ModelRunner,
+        loader: Any,
+        n_init: int = 8,
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype = torch.double,
+        timing_samples: int = 8,
+        timing_runs: int = 10,
+        seed: Optional[int] = None,
+    ) -> None:
+        self.timing_samples = min(128, timing_samples)
+        self.timing_runs = timing_runs
+        self.path = "pareto_layer_" + str(layer_idx) + ".png"
+        self.evals = 0
+        self.dim: int = 5
+        self.model_runner = model_runner
+        model_runner.model.to("cpu") # move to cpu
+        self.loader = loader
+        self.n_init: int = n_init
+        self.device: torch.device = torch.device(device)
+        self.dtype: torch.dtype = dtype
+        self.layer_idx = layer_idx
+        self.layer_acts_init = False
+        self.inps = None
+        self.outs = None
+        self.position_embeddings = None
+        self.attention_mask = None
+        self.weights_copy = None
+        self.blocksize_max = 64
+        self.nm_max = 64
+        self.sparsity_max = 0.9
+        self.act_blocksize_max = 64
+        if seed is not None:
+            torch.manual_seed(seed)
+        self.train_X: Optional[Tensor] = None
+        self.train_Y: Optional[Tensor] = None
+        self.train_Y_raw: Optional[Tensor] = None
+        self.ref_point: Optional[Tensor] = None
+
+    def sample_config(self) -> DuoGPTConfig:
+        config: DuoGPTConfig = DEFAULT_CONFIG
+        # DuoGPTConfig: Hyperparameters changed are
+        # blocksize [1, 256] int
+        # prunen, prunem n < m ints, [0, 256]
+        # sparsity [0,1] float
+        # act_blocksize [0, 256] int
+        # 5 dimensions
+        config.blocksize = random.randint(1, self.blocksize_max)
+        config.prunem = random.randint(0, self.nm_max)
+        config.prunen = random.randint(0, max(0,config.prunem-1))
+        config.sparsity = min(random.random(), self.sparsity_max)
+        config.act_blocksize = random.randint(0, self.act_blocksize_max)
+
+        return config
+    # blocksize, prunen, prunem, sparsity, act_blocksize
+    def config_to_vector(self, config: DuoGPTConfig) -> Tensor:
+        ret = torch.ones(self.dim, device=self.device, dtype=self.dtype)
+        ret[0] = config.blocksize / self.blocksize_max
+        ret[1] = config.prunem / self.nm_max
+        ret[2] = config.prunen / self.nm_max
+        ret[3] = config.sparsity
+        ret[4] = config.act_blocksize / self.act_blocksize_max
+        return ret
 
 
-@dataclass
-class BayesianTuner:
-    space: PruningSearchSpace
-    objective: PerformanceMetric
-    surrogate_noise: float = 1e-4
-    explore: float = 0.01
-    device: torch.device = torch.device("cpu")
+    def vector_to_config(self, x: Tensor) -> DuoGPTConfig:
+        ret = DEFAULT_CONFIG
+        ret.blocksize = max(1,round(x[0].item() * self.blocksize_max))
+        ret.prunem = round(x[1].item() * self.nm_max)
+        ret.prunen = min(round(x[2].item() * self.nm_max), max(0,ret.prunem-1))
+        ret.sparsity = min(x[3].item(), self.sparsity_max)
+        ret.act_blocksize = round(x[4].item() * self.act_blocksize_max)
+        return ret
 
-    def __post_init__(self) -> None:
-        self.surrogate = GaussianProcess(len(self.space.parameters), self.surrogate_noise).to(self.device)
-        self.dataset = EvaluationDataset(self.space)
+    def free(self):
+        for name in self.weights_copy:
+            self.weights_copy[name] = None
+            self.inps = None
+            self.outs = None
+            self.position_embeddings = None
+            self.attention_mask = None
+            self.layer_acts_init = False
+            cleanup_memory()
 
-    def seed(self, plans: Sequence[LayerPrunePlan], evaluations: Sequence[LayerEvaluation]) -> None:
-        for plan, eval_ in zip(plans, evaluations):
-            self.dataset.add(eval_)
+    def reset_weights(self):
+        if self.weights_copy is None:
+            return
+        for name in self.weights_copy:
+            self.model_runner.model.model.layers[self.layer_idx]\
+            .get_submodule(name).weight.data = self.weights_copy[name]
 
-    def best(self) -> Optional[LayerEvaluation]:
-        if not self.dataset.records:
-            return None
-        metric = self.objective.value
-        return min(self.dataset.records, key=lambda r: r.metrics[metric])
+    @torch.no_grad()
+    def evaluate(self, config: DuoGPTConfig) -> Tuple[float, float]:
+        self.evals += 1
+        print("Evaluating config:", config)
+        layer = self.model_runner.model.model.layers[self.layer_idx]
+        res = (0., 0.)
+        if not self.layer_acts_init:
+            inps, outs = prealloc_inps_outs(self.model_runner, config)
+            self.inps = inps
+            self.outs = outs
+        calib_result = capture_embeddings(self.model_runner, self.loader, self.layer_idx, self.inps, self.outs,
+                                          inps_contain_layer_inps= self.layer_acts_init,
+                                          position_embeddings = self.position_embeddings,
+                                          attention_mask = self.attention_mask,args= config)
+        self.position_embeddings = calib_result.position_embeddings
+        self.attention_mask = calib_result.attention_mask
+        self.layer_acts_init = True
 
-    def next(self, candidates: Sequence[LayerPrunePlan]) -> Optional[LayerPrunePlan]:
-        if not self.dataset.records:
-            return candidates[0] if candidates else None
-        x_train, y_train = self.dataset.as_tensors(self.objective)
-        x_train = x_train.to(self.device)
-        y_train = y_train.to(self.device)
-        mean: List[float] = []
-        var: List[float] = []
-        for plan in candidates:
-            x_test = self.space.normalise_plan(plan.as_dict()).unsqueeze(0).to(self.device)
-            m, v = self.surrogate.predict(x_train, y_train, x_test)
-            mean.append(float(m.item()))
-            var.append(float(v.item()))
-        best_value = min(r.metrics[self.objective.value] for r in self.dataset.records)
-        ei = expected_improvement(torch.tensor(mean), torch.tensor(var), best_value, self.explore)
-        idx = int(torch.argmax(ei).item())
-        return candidates[idx]
+        extra = {"attention_mask": self.attention_mask, "position_embeddings": self.position_embeddings}
+        # save weights
+        self.weights_copy = {}
+        for name, item in calib_result.pruner_state.items():
+            self.weights_copy[name] = item.layer.weight.data.clone().cpu()
+        cleanup_memory()
+        layer_dev = next(iter(layer.parameters())).device
+        layer.to(self.model_runner.device)
+        time_unpruned = self.model_runner.get_layerwise_perf(self.inps[:self.timing_samples], layer, extra, runs=self.timing_runs)["time"]
+        layer.to(layer_dev)
+        cleanup_memory()
+        for name in calib_result.pruner_state:
+            calib_result.pruner_state[name].fasterprune(config)
 
-    def update(self, evaluation: LayerEvaluation) -> None:
-        self.dataset.add(evaluation)
+        for name in calib_result.pruner_state:
+            calib_result.pruner_state[name].free()
+
+        layer.to(self.model_runner.device)
+        time_pruned = self.model_runner.get_layerwise_perf(self.inps[:self.timing_samples], layer, extra, runs=self.timing_runs)["time"]
+        layer.to(layer_dev)
+
+        layer.to(self.model_runner.device)
+
+        residual = 0. # 0-3
+        speedup = time_unpruned/time_pruned if time_pruned != 0 else 1
+        with torch.no_grad():
+            new = layer(self.inps[:8], attention_mask = self.attention_mask, position_embeddings=self.position_embeddings)
+            cleanup_memory()
+            residual = (
+                (new - self.outs[:8]).norm(dim=-1) / (self.outs[:8].norm(dim=-1) + 1e-8)
+            ).mean().item()
+            del new
+
+        layer.to(layer_dev)
+        print(f"Evaluation complete: speedup={speedup}, residual={residual}")
+        res = (speedup/10, residual/3)
+
+        self.reset_weights()
+        cleanup_memory()
+        return res
+
+    def _update_ref_point(self) -> None:
+        if self.train_Y is None:
+            raise RuntimeError("train_Y is None")
+        y_min: Tensor = self.train_Y.min(dim=0).values
+        self.ref_point = (y_min - 0.1).to(device=self.device, dtype=self.dtype)
+
+    def initialize(self) -> None:
+        xs: List[Tensor] = []
+        ys_raw: List[Tuple[float, float]] = []
+        for _ in range(self.n_init):
+            cfg: DuoGPTConfig = self.sample_config()
+            x: Tensor = self.config_to_vector(cfg).to(self.device, self.dtype)
+            r, t = self.evaluate(cfg)
+            xs.append(x)
+            ys_raw.append((r, t))
+        self.train_X = torch.stack(xs)
+        self.train_Y_raw = torch.tensor(ys_raw, device=self.device, dtype=self.dtype)
+        speedup: Tensor = self.train_Y_raw[:, [0]]
+        residual: Tensor = self.train_Y_raw[:, [1]]
+        self.train_Y = torch.cat([speedup, -residual], dim=-1)
+        self._update_ref_point()
+
+    def _build_model(self) -> ModelListGP:
+        if self.train_X is None or self.train_Y is None:
+            raise RuntimeError("Call initialize() first")
+        y1: Tensor = self.train_Y[:, [0]]
+        y2: Tensor = self.train_Y[:, [1]]
+        m1: SingleTaskGP = SingleTaskGP(self.train_X, y1)
+        m2: SingleTaskGP = SingleTaskGP(self.train_X, y2)
+        return ModelListGP(m1, m2)
+
+    def get_saved(self) -> Tuple:
+        if(self.layer_acts_init is False):
+            print("attempting to get saved results of layer before it is processed")
+            exit(-1)
+        return (self.outs, self.inps, self.attention_mask, self.position_embeddings)
+
+    def load_saved(self, saved):
+        self.layer_acts_init = True
+        # invert inps, outs
+        self.inps, self.outs, self.attention_mask, self.position_embeddings = saved
+
+    def step(
+        self,
+        q: int = 1,
+        num_restarts: int = 5,
+        raw_samples: int = 64,
+        num_samples_acq: int = 128,
+    ) -> Tuple[Tensor, Tensor]:
+        if self.train_X is None or self.train_Y is None:
+            self.initialize()
+        if self.train_X is None or self.train_Y is None or self.ref_point is None:
+            raise RuntimeError("Initialization failed")
+        model: ModelListGP = self._build_model().to(self.device, self.dtype)
+        mll: SumMarginalLogLikelihood = SumMarginalLogLikelihood(model.likelihood, model)
+        fit_gpytorch_mll(mll)
+        partitioning: NondominatedPartitioning = NondominatedPartitioning(
+            ref_point=self.ref_point,
+            Y=self.train_Y,
+        )
+        sampler: SobolQMCNormalSampler = SobolQMCNormalSampler(torch.Size((num_samples_acq,)))
+        acq = qLogExpectedHypervolumeImprovement( #qExpectedHypervolumeImprovement(
+            model=model,
+            ref_point=self.ref_point,
+            partitioning=partitioning,
+            sampler=sampler,
+        )
+        bounds: Tensor = torch.stack(
+            [
+                torch.zeros(self.dim, device=self.device, dtype=self.dtype),
+                torch.ones(self.dim, device=self.device, dtype=self.dtype),
+            ]
+        )
+        candidates, _ = optimize_acqf(
+            acq_function=acq,
+            bounds=bounds,
+            q=q,
+            num_restarts=num_restarts,
+            raw_samples=raw_samples,
+            sequential=True,
+        )
+        new_y_raw_list: List[Tuple[float, float]] = []
+        for x in candidates:
+            cfg: DuoGPTConfig = self.vector_to_config(x.detach())
+            r, t = self.evaluate(cfg)
+            new_y_raw_list.append((r, t))
+        new_Y_raw: Tensor = torch.tensor(new_y_raw_list, device=self.device, dtype=self.dtype)
+        new_speedup: Tensor = new_Y_raw[:, [0]]
+        new_residual: Tensor = new_Y_raw[:, [1]]
+        new_Y: Tensor = torch.cat([new_speedup, -new_residual], dim=-1)
+        self.train_X = torch.cat([self.train_X, candidates], dim=0)
+        self.train_Y_raw = torch.cat([self.train_Y_raw, new_Y_raw], dim=0)
+        self.train_Y = torch.cat([self.train_Y, new_Y], dim=0)
+
+        self._update_ref_point()
+        return candidates, new_Y_raw
+
+    def run(self, n_steps: int, **step_kwargs: Any) -> None:
+        for _ in range(n_steps):
+            self.step(**step_kwargs)
+
+    def pareto_front(self) -> Tuple[Tensor, Tensor]:
+        if self.train_X is None or self.train_Y_raw is None:
+            raise RuntimeError("No data")
+        Y: Tensor = self.train_Y_raw
+        n: int = Y.shape[0]
+        mask: Tensor = torch.ones(n, dtype=torch.bool, device=Y.device)
+        for i in range(n):
+            if not mask[i]:
+                continue
+            s_i: Tensor = Y[i, 0]
+            r_i: Tensor = Y[i, 1]
+            better_or_equal_speedup: Tensor = Y[:, 0] >= s_i
+            better_or_equal_residual: Tensor = Y[:, 1] <= r_i
+            strictly_better: Tensor = (Y[:, 0] > s_i) | (Y[:, 1] < r_i)
+            dominates: Tensor = better_or_equal_speedup & better_or_equal_residual & strictly_better
+            mask[dominates] = False
+        return self.train_X[mask], self.train_Y_raw[mask]
+
+
+    def plot(self) -> None :
+        if self.train_Y_raw is None or self.train_X is None:
+            raise RuntimeError("No data")
+        X_pf, Y_pf = self.pareto_front()
+        Y_all: Tensor = self.train_Y_raw
+        Y_pf[:,0] *= 10
+        Y_pf[:, 1] *=3
+        Y_all[:,0] *=10
+        Y_all[:, 1] *= 3
+        fig, ax = plt.subplots()
+        ax.scatter(
+            Y_all[:, 0].detach().cpu().numpy(),
+            Y_all[:, 1].detach().cpu().numpy(),
+            alpha=0.4,
+        )
+        ax.scatter(
+            Y_pf[:, 0].detach().cpu().numpy(),
+            Y_pf[:, 1].detach().cpu().numpy(),
+        )
+        ax.set_xlabel("speedup")
+        ax.set_ylabel("residual")
+        fig.tight_layout()
+        fig.savefig(self.path)
+        plt.close(fig)

@@ -4,6 +4,7 @@ from typing import Any, Dict
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function  # noqa: F401
 
+from better_prune.utils.plot import plot_weights_heatmap
 from better_prune.model_runner import ModelRunner
 from better_prune.pruner.obc import (  # noqa: F401
     DEFAULT_CONFIG,
@@ -15,13 +16,37 @@ from better_prune.pruner.obc import (  # noqa: F401
     prealloc_inps_outs,
     capture_embeddings,
 )
+from better_prune.pruner.ops import ObcOp
+
 from better_prune.pruner.tuning_structures import (
     LayerMetrics,
-    LayerPrunePlan, # noqa: F401
     build_layer_evaluation,
     duo_to_layer,
 )
 from better_prune.utils.helpers import tensor_sparsity
+
+from better_prune.pruner.tuning_structures import BayesianForObc
+
+@torch.no_grad
+def calibrate_model_using_ops(model: ModelRunner, loader: Any) -> None:
+    op = ObcOp()
+    for i, _ in enumerate(model.model.model.layers):
+        op._apply_inner(model,i)
+        print("OK!")
+
+def run_bo_obc(model: ModelRunner, loader: Any) -> None:
+    saved = None
+    for layer_idx in range(len(model.model.model.layers)):
+        model.model.to("cpu")
+        bo = BayesianForObc(layer_idx, model, loader, 8, "cpu")
+        if saved is not None:
+            bo.load_saved(saved)
+        bo.run(n_steps= 20, q=1, num_restarts=10, raw_samples = 128, num_samples_acq=256)
+        bo.plot()
+        saved = bo.get_saved()
+        bo.free()
+        print(f"Completed BO for layer {layer_idx} with evals {bo.evals}")
+        cleanup_memory()
 
 
 @torch.no_grad
@@ -77,12 +102,22 @@ def calibrate_model(model: ModelRunner, loader: Any, layer_stats: Dict = {}) -> 
         total_cuda_time = model.get_layerwise_perf(inps[:8], layer, extra)["time"]
         print(f"Total CUDA time unpruned: {total_cuda_time:.3f} us")
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         layer.to(layer_dev)
         cleanup_memory()
 
         state = x.pruner_state
         for k in state:
+            print("Plotting weights heatmap for ", k, " before pruning")
+            plot_weights_heatmap(state[k].layer.weight.data.clone(), 
+                                 path=f"layer_{i}_{k}_before_pruning.png")
             state[k].fasterprune()
+            print("Plotting weights heatmap for ", k, " before pruning")
+            plot_weights_heatmap(state[k].layer.weight.data.clone(), 
+                                 path=f"layer_{i}_{k}_after_pruning.png")
+            cleanup_memory()
+
         for k in state:
             state[k].free()
         del x
@@ -99,8 +134,12 @@ def calibrate_model(model: ModelRunner, loader: Any, layer_stats: Dict = {}) -> 
                 (inps[:8] - outs[:8]).norm(dim=-1) / (outs[:8].norm(dim=-1) + 1e-8)
             ).mean().item()
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         layer.to(layer_dev)
         total_cuda_time = model.get_layerwise_perf(inps[:8], layer, extra)["time"]
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         cleanup_memory()
 
         for _, param in layer.named_parameters():
